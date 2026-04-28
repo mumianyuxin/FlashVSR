@@ -407,8 +407,8 @@ def warmup_pipeline(pipe, meta, dit_runner, topk_ratio):
     """Run dummy forward passes to trigger CUDA kernel JIT compilation before the timed loop."""
     device = pipe.device
     dtype = pipe.torch_dtype
-    lH = meta.target_height // 16
-    lW = meta.target_width // 16
+    lH = meta.target_height // 8
+    lW = meta.target_width // 8
 
     print(f"[warmup] starting at {meta.target_width}x{meta.target_height} ...")
     t_start = time.perf_counter()
