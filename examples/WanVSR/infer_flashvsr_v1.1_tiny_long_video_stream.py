@@ -7,6 +7,7 @@ import os
 import time
 from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor
+from queue import Queue
 
 import imageio
 import numpy as np
@@ -64,10 +65,9 @@ def pil_to_tensor_neg1_1(img, dtype=torch.bfloat16):
     return t.to(dtype)
 
 
-def tensor_to_uint8_frames(frames):
+def tensor_to_uint8_frames_gpu(frames):
     frames = rearrange(frames, "C T H W -> T H W C").contiguous()
-    frames = frames.float().add_(1.0).mul_(127.5).clamp_(0, 255).to(torch.uint8)
-    return frames.cpu().numpy()
+    return frames.float().add_(1.0).mul_(127.5).clamp_(0, 255).to(torch.uint8)
 
 
 @dataclass
@@ -131,12 +131,13 @@ class ChunkPlan:
 
 
 class StreamingVideoFrames:
-    def __init__(self, path, scale=2.0, dtype=torch.bfloat16):
+    def __init__(self, path, scale=2.0, dtype=torch.bfloat16, pin_memory=False):
         if not is_video(path):
             raise ValueError(f"Unsupported input: {path}")
         self.path = path
         self.scale = scale
         self.dtype = dtype
+        self.pin_memory = pin_memory
         self.reader = imageio.get_reader(path)
         self.cache = {}
 
@@ -196,11 +197,17 @@ class StreamingVideoFrames:
         frames = []
         for idx in range(start, end):
             if idx not in self.cache:
-                self.cache[idx] = self._read_frame_tensor(idx)
+                frame = self._read_frame_tensor(idx)
+                if self.pin_memory:
+                    frame = frame.pin_memory()
+                self.cache[idx] = frame
             frames.append(self.cache[idx])
         if not frames:
             return None
-        return torch.stack(frames, 0).permute(1, 0, 2, 3).unsqueeze(0)
+        out = torch.stack(frames, 0).permute(1, 0, 2, 3).unsqueeze(0)
+        if self.pin_memory and not out.is_pinned():
+            out = out.pin_memory()
+        return out
 
     def release_before(self, idx):
         for key in [key for key in self.cache if key < idx]:
@@ -243,8 +250,8 @@ def load_chunk_inputs(reader, plan):
 
 
 class ChunkPrefetcher:
-    def __init__(self, path, scale, dtype):
-        self.reader = StreamingVideoFrames(path, scale=scale, dtype=dtype)
+    def __init__(self, path, scale, dtype, pin_memory=False):
+        self.reader = StreamingVideoFrames(path, scale=scale, dtype=dtype, pin_memory=pin_memory)
         self.executor = ThreadPoolExecutor(max_workers=1)
         self.future = None
         self.chunk_idx = None
@@ -267,6 +274,56 @@ class ChunkPrefetcher:
             self.future = None
         self.executor.shutdown(wait=True)
         self.reader.close()
+
+
+class AsyncVideoWriter:
+    def __init__(self, output_path, fps, quality, enabled=True):
+        self.writer = imageio.get_writer(output_path, fps=fps, quality=quality)
+        self.enabled = enabled
+        self.queue = Queue(maxsize=2) if enabled else None
+        self.thread = None
+        self.stop_token = object()
+        self.exception = None
+
+        if self.enabled:
+            import threading
+            self.thread = threading.Thread(target=self._worker, daemon=True)
+            self.thread.start()
+
+    def _worker(self):
+        try:
+            while True:
+                item = self.queue.get()
+                if item is self.stop_token:
+                    self.queue.task_done()
+                    break
+                cpu_frames, ready_event = item
+                ready_event.synchronize()
+                frames_np = cpu_frames.numpy()
+                for frame in frames_np:
+                    self.writer.append_data(frame)
+                self.queue.task_done()
+        except Exception as exc:
+            self.exception = exc
+
+    def submit(self, cpu_frames, ready_event):
+        if self.exception is not None:
+            raise self.exception
+        if not self.enabled:
+            ready_event.synchronize()
+            frames_np = cpu_frames.numpy()
+            for frame in frames_np:
+                self.writer.append_data(frame)
+            return
+        self.queue.put((cpu_frames, ready_event))
+
+    def close(self):
+        if self.enabled:
+            self.queue.put(self.stop_token)
+            self.thread.join()
+        self.writer.close()
+        if self.exception is not None:
+            raise self.exception
 
 
 def init_pipeline(device="cuda", dtype=torch.bfloat16, enable_vram_management=False):
@@ -350,8 +407,9 @@ def build_dit_runner(pipe, args):
 
 def run_streaming(args):
     dtype = torch.bfloat16
-    reader = StreamingVideoFrames(args.input, scale=args.scale, dtype=dtype)
-    prefetcher = ChunkPrefetcher(args.input, scale=args.scale, dtype=dtype)
+    use_pinned_memory = args.pin_memory and args.device.startswith("cuda")
+    reader = StreamingVideoFrames(args.input, scale=args.scale, dtype=dtype, pin_memory=use_pinned_memory)
+    prefetcher = ChunkPrefetcher(args.input, scale=args.scale, dtype=dtype, pin_memory=use_pinned_memory)
     meta = reader.meta
     print(
         f"[{os.path.basename(args.input)}] Original Resolution: {meta.width}x{meta.height} | "
@@ -388,7 +446,13 @@ def run_streaming(args):
     chunk_times = []
     total_start = time.perf_counter()
 
-    writer = imageio.get_writer(args.output, fps=meta.fps, quality=args.quality)
+    writer = AsyncVideoWriter(
+        args.output,
+        fps=meta.fps,
+        quality=args.quality,
+        enabled=not args.disable_async_writer,
+    )
+    copy_stream = torch.cuda.Stream(device=pipe.device) if args.device.startswith("cuda") else None
     run_profile = RunProfile()
     profiler_table = None
     profiler_trace = None
@@ -424,7 +488,9 @@ def run_streaming(args):
                     with record_function("flashvsr_lq_proj"):
                         for lq_clip in prefetched["stream_clips"]:
                             t1 = time.perf_counter()
-                            cur = pipe.denoising_model().LQ_proj_in.stream_forward(lq_clip.to(pipe.device))
+                            cur = pipe.denoising_model().LQ_proj_in.stream_forward(
+                                lq_clip.to(pipe.device, non_blocking=use_pinned_memory)
+                            )
                             chunk_profile.lq_proj_time += time.perf_counter() - t1
                             lq_latents = concat_lq_latents(lq_latents, cur)
                     cur_latents = latents[:, :, plan.output_latent_start:plan.output_latent_end, :, :]
@@ -433,7 +499,9 @@ def run_streaming(args):
                     with record_function("flashvsr_lq_proj"):
                         for lq_clip in prefetched["stream_clips"]:
                             t1 = time.perf_counter()
-                            cur = pipe.denoising_model().LQ_proj_in.stream_forward(lq_clip.to(pipe.device))
+                            cur = pipe.denoising_model().LQ_proj_in.stream_forward(
+                                lq_clip.to(pipe.device, non_blocking=use_pinned_memory)
+                            )
                             chunk_profile.lq_proj_time += time.perf_counter() - t1
                             lq_latents = concat_lq_latents(lq_latents, cur)
                     cur_latents = latents[:, :, plan.output_latent_start:plan.output_latent_end, :, :]
@@ -446,7 +514,7 @@ def run_streaming(args):
                     chunk_profile.dit_time += time.perf_counter() - t0
 
                 cur_latents = cur_latents - noise_pred_posi
-                cur_lq_frame = prefetched["cond"].to(pipe.device)
+                cur_lq_frame = prefetched["cond"].to(pipe.device, non_blocking=use_pinned_memory)
                 with record_function("flashvsr_decode"):
                     t1 = time.perf_counter()
                     cur_frames = pipe.TCDecoder.decode_video(
@@ -474,14 +542,27 @@ def run_streaming(args):
 
                 with record_function("flashvsr_to_uint8"):
                     t0 = time.perf_counter()
-                    out_frames = tensor_to_uint8_frames(cur_frames[0])
+                    out_frames_gpu = tensor_to_uint8_frames_gpu(cur_frames[0])
                     chunk_profile.to_uint8_time += time.perf_counter() - t0
                 with record_function("flashvsr_write"):
                     t1 = time.perf_counter()
-                    for frame in out_frames:
-                        writer.append_data(frame)
+                    if copy_stream is not None:
+                        cpu_frames = torch.empty_like(out_frames_gpu, device="cpu", pin_memory=True)
+                        current_stream = torch.cuda.current_stream(pipe.device)
+                        copy_stream.wait_stream(current_stream)
+                        with torch.cuda.stream(copy_stream):
+                            cpu_frames.copy_(out_frames_gpu, non_blocking=True)
+                            ready_event = torch.cuda.Event()
+                            ready_event.record(copy_stream)
+                        writer.submit(cpu_frames, ready_event)
+                    else:
+                        cpu_frames = out_frames_gpu.cpu()
+                        class _Ready:
+                            def synchronize(self_inner):
+                                return None
+                        writer.submit(cpu_frames, _Ready())
                     chunk_profile.write_time += time.perf_counter() - t1
-                frames_written += len(out_frames)
+                frames_written += len(out_frames_gpu)
 
                 chunk_time = time.perf_counter() - chunk_start
                 chunk_profile.total_time = chunk_time
@@ -512,7 +593,7 @@ def run_streaming(args):
                         prof_ctx.export_chrome_trace(args.profile_trace)
                         profiler_trace = args.profile_trace
 
-                del cur_lq_frame, cur_frames, out_frames, noise_pred_posi, lq_latents
+                del cur_lq_frame, cur_frames, out_frames_gpu, noise_pred_posi, lq_latents
     finally:
         writer.close()
         reader.close()
@@ -629,6 +710,10 @@ def parse_args():
     parser.add_argument("--torch-compile", action="store_true")
     parser.add_argument("--torch-compile-mode", default="reduce-overhead")
     parser.add_argument("--torch-compile-backend", default="inductor")
+    parser.set_defaults(pin_memory=True)
+    parser.add_argument("--pin-memory", dest="pin_memory", action="store_true")
+    parser.add_argument("--no-pin-memory", dest="pin_memory", action="store_false")
+    parser.add_argument("--disable-async-writer", action="store_true")
     return parser.parse_args()
 
 
