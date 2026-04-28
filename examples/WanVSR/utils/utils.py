@@ -85,7 +85,8 @@ class Buffer_LQ4x_Proj(nn.Module):
         self.norm2 = RMS_norm(self.hidden_dim2, images=False)
         self.act2 = nn.SiLU()
 
-        self.linear_layers = nn.ModuleList([nn.Linear(self.hidden_dim2, out_dim) for _ in range(layer_num)])
+        self.out_dim = out_dim
+        self.linear = nn.Linear(self.hidden_dim2, out_dim * layer_num)
 
         self.clip_idx = 0
 
@@ -118,10 +119,7 @@ class Buffer_LQ4x_Proj(nn.Module):
         out_x = torch.cat(out_x, dim = 2)
         # print(out_x.shape)
         out_x = rearrange(out_x, 'b c f h w -> b (f h w) c')
-        outputs = []
-        for i in range(self.layer_num):
-            outputs.append(self.linear_layers[i](out_x))
-        return outputs
+        return self._project_outputs(out_x)
 
     def clear_cache(self):
         self.cache = {}
@@ -157,11 +155,34 @@ class Buffer_LQ4x_Proj(nn.Module):
             x = self.norm2(x)
             x = self.act2(x)
             out_x = rearrange(x, 'b c f h w -> b (f h w) c')
-            outputs = []
-            for i in range(self.layer_num):
-                outputs.append(self.linear_layers[i](out_x))
             self.clip_idx += 1
-            return outputs
+            return self._project_outputs(out_x)
+
+    def _project_outputs(self, out_x):
+        fused = self.linear(out_x)
+        fused = fused.view(*out_x.shape[:2], self.layer_num, self.out_dim)
+        return [fused[:, :, i, :] for i in range(self.layer_num)]
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
+                              missing_keys, unexpected_keys, error_msgs):
+        legacy_weight_keys = [f"{prefix}linear_layers.{i}.weight" for i in range(self.layer_num)]
+        legacy_bias_keys = [f"{prefix}linear_layers.{i}.bias" for i in range(self.layer_num)]
+        fused_weight_key = f"{prefix}linear.weight"
+        fused_bias_key = f"{prefix}linear.bias"
+
+        if fused_weight_key not in state_dict and all(key in state_dict for key in legacy_weight_keys):
+            state_dict[fused_weight_key] = torch.cat([state_dict[key] for key in legacy_weight_keys], dim=0)
+        if fused_bias_key not in state_dict and all(key in state_dict for key in legacy_bias_keys):
+            state_dict[fused_bias_key] = torch.cat([state_dict[key] for key in legacy_bias_keys], dim=0)
+
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict,
+            missing_keys, unexpected_keys, error_msgs
+        )
+
+        for key in legacy_weight_keys + legacy_bias_keys:
+            if key in unexpected_keys:
+                unexpected_keys.remove(key)
 
 class Causal_LQ4x_Proj(nn.Module):
 
@@ -184,7 +205,8 @@ class Causal_LQ4x_Proj(nn.Module):
         self.norm2 = RMS_norm(self.hidden_dim2, images=False)
         self.act2 = nn.SiLU()
 
-        self.linear_layers = nn.ModuleList([nn.Linear(self.hidden_dim2, out_dim) for _ in range(layer_num)])
+        self.out_dim = out_dim
+        self.linear = nn.Linear(self.hidden_dim2, out_dim * layer_num)
 
         self.clip_idx = 0
 
@@ -217,10 +239,7 @@ class Causal_LQ4x_Proj(nn.Module):
             out_x.append(x)
         out_x = torch.cat(out_x, dim = 2)
         out_x = rearrange(out_x, 'b c f h w -> b (f h w) c')
-        outputs = []
-        for i in range(self.layer_num):
-            outputs.append(self.linear_layers[i](out_x))
-        return outputs
+        return self._project_outputs(out_x)
 
     def clear_cache(self):
         self.cache = {}
@@ -256,8 +275,31 @@ class Causal_LQ4x_Proj(nn.Module):
             x = self.norm2(x)
             x = self.act2(x)
             out_x = rearrange(x, 'b c f h w -> b (f h w) c')
-            outputs = []
-            for i in range(self.layer_num):
-                outputs.append(self.linear_layers[i](out_x))
             self.clip_idx += 1
-            return outputs
+            return self._project_outputs(out_x)
+
+    def _project_outputs(self, out_x):
+        fused = self.linear(out_x)
+        fused = fused.view(*out_x.shape[:2], self.layer_num, self.out_dim)
+        return [fused[:, :, i, :] for i in range(self.layer_num)]
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
+                              missing_keys, unexpected_keys, error_msgs):
+        legacy_weight_keys = [f"{prefix}linear_layers.{i}.weight" for i in range(self.layer_num)]
+        legacy_bias_keys = [f"{prefix}linear_layers.{i}.bias" for i in range(self.layer_num)]
+        fused_weight_key = f"{prefix}linear.weight"
+        fused_bias_key = f"{prefix}linear.bias"
+
+        if fused_weight_key not in state_dict and all(key in state_dict for key in legacy_weight_keys):
+            state_dict[fused_weight_key] = torch.cat([state_dict[key] for key in legacy_weight_keys], dim=0)
+        if fused_bias_key not in state_dict and all(key in state_dict for key in legacy_bias_keys):
+            state_dict[fused_bias_key] = torch.cat([state_dict[key] for key in legacy_bias_keys], dim=0)
+
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict,
+            missing_keys, unexpected_keys, error_msgs
+        )
+
+        for key in legacy_weight_keys + legacy_bias_keys:
+            if key in unexpected_keys:
+                unexpected_keys.remove(key)
