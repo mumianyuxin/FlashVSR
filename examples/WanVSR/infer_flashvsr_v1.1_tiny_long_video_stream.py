@@ -63,9 +63,9 @@ def pil_to_tensor_neg1_1(img, dtype=torch.bfloat16):
 
 
 def tensor_to_uint8_frames(frames):
-    frames = rearrange(frames, "C T H W -> T H W C")
-    frames = ((frames.float() + 1) * 127.5).clip(0, 255).cpu().numpy().astype(np.uint8)
-    return frames
+    frames = rearrange(frames, "C T H W -> T H W C").contiguous()
+    frames = frames.float().add_(1.0).mul_(127.5).clamp_(0, 255).to(torch.uint8)
+    return frames.cpu().numpy()
 
 
 @dataclass
