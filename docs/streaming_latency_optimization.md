@@ -208,11 +208,36 @@ The steady-state improvement is within measurement noise. DiT (`1.143s`, `~98.9%
 - `steady FPS`: `~6.92`
 - `peak_mem`: `23.91 GiB`
 
+## Round 3: FP8 Quantization Experiment
+
+Tested `--fp8` flag (DiT linear layers replaced with `torch._scaled_mm` FP8 GEMM, per-tensor dynamic scales).
+
+| | BF16 baseline | FP8 dynamic |
+| --- | --- | --- |
+| `dit` | `1.143s` | `1.192s` |
+| `steady_chunk_avg` | `1.156s` | `1.209s` |
+| `steady FPS` | `~6.92` | `~6.62` |
+
+**FP8 was 4.6% slower.** Root causes:
+
+1. **Non-contiguous activation copies**: `rearrange('b c f h w -> b (f h w) c')` before lq_proj produces a [5824, 3072] tensor with strides `(1, 5824)` (column-major). cuBLASLt rejects column-major A matrices, so `.contiguous()` must copy ~36 MB per call.
+2. **Per-tensor dynamic scale overhead**: `abs().max()` reduction over [N, K] activations on every forward pass, across ~30 blocks × multiple linears.
+3. **Attention is not quantized**: block-sparse attention (`418ms`, `36.6%` of DiT) is unchanged; FP8 can only help the `addmm` portion (`216ms`, `18.9%`). Even a theoretical 2× GEMM speedup saves only ~108ms out of `~1.14s`, dropping steady FPS to ~9.5.
+
+The overhead from (1) and (2) exceeds the GEMM speedup at these sequence lengths.
+
+**Path to working FP8 speedup**:
+- Static/calibration-based activation scales (eliminates `abs().max()` per forward pass)
+- Pre-transpose activations before FP8 layers (eliminates `.contiguous()` copy)
+- `torchao` with a compatible torch version (requires torch >= 2.11 for torchao ≥ 0.17)
+- Quantize attention (FlashAttention FP8 variant, once available for block-sparse)
+
 ## Conclusion
 
-The warmup pass resolves the first-chunk latency regression. The copy-stream move for `to_uint8` is correct but adds no measurable steady-state benefit because DiT already dominates at `~1.14s` per chunk.
+The warmup pass resolves the first-chunk latency regression. The copy-stream move for `to_uint8` is correct but adds no measurable steady-state benefit. Dynamic FP8 quantization via `torch._scaled_mm` adds overhead that exceeds its speedup at 480p.
 
-Reaching 16 FPS at `480p` requires DiT < 400ms. This is not achievable through inference-pipeline changes alone. The path forward is:
-- FP8/INT8 quantization of the GEMM and convolution ops (potential 2–4× on H20)
+DiT dominates at `~1.14s` per chunk (BF16). Reaching 16 FPS at `480p` requires DiT < 400ms. This is not achievable through inference-pipeline changes alone. The path forward is:
+- Static FP8 calibration or torchao (with compatible torch version)
+- Tensor parallelism across 2+ GPUs (measured estimate: 2 GPU → ~13.8 FPS, 4 GPU → ~25 FPS)
 - Reducing model depth or dimension
 - Reducing temporal output per chunk (architectural change)
