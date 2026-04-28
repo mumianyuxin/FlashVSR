@@ -324,6 +324,58 @@ class AsyncVideoWriter:
             raise self.exception
 
 
+# ---------------------------------------------------------------------------
+# FP8 quantization (Hopper / torch._scaled_mm path)
+# ---------------------------------------------------------------------------
+
+class _FP8Linear(torch.nn.Module):
+    """Drop-in nn.Linear replacement using FP8 GEMM via torch._scaled_mm."""
+
+    def __init__(self, linear: torch.nn.Linear):
+        super().__init__()
+        w = linear.weight.detach().float()                              # [out, in]
+        scale_w = w.abs().max().clamp(min=1e-12) / 448.0
+        w_fp8 = (w / scale_w).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+        self.register_buffer("weight_fp8_T", w_fp8.T.contiguous())     # [in, out]
+        self.register_buffer("scale_w", scale_w.float().view(1))
+        if linear.bias is not None:
+            self.register_buffer("bias", linear.bias.detach().clone())
+        else:
+            self.bias = None
+        self.out_features = linear.out_features
+        self.in_features = linear.in_features
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        orig_shape = x.shape
+        x_2d = x.reshape(-1, self.in_features)
+        scale_x = x_2d.abs().max().float().clamp(min=1e-12).view(1) / 448.0
+        x_fp8 = x_2d.to(torch.float32).div_(scale_x).clamp_(-448.0, 448.0).to(torch.float8_e4m3fn)
+        out = torch._scaled_mm(
+            x_fp8, self.weight_fp8_T,
+            scale_a=scale_x, scale_b=self.scale_w,
+            out_dtype=x.dtype, use_fast_accum=True,
+        )
+        out = out.reshape(*orig_shape[:-1], self.out_features)
+        if self.bias is not None:
+            out = out + self.bias
+        return out
+
+
+def _replace_linear_fp8(module: torch.nn.Module) -> None:
+    for name, child in list(module.named_children()):
+        if isinstance(child, torch.nn.Linear):
+            setattr(module, name, _FP8Linear(child).to(child.weight.device))
+        else:
+            _replace_linear_fp8(child)
+
+
+def apply_fp8_quantization(pipe) -> None:
+    t0 = time.perf_counter()
+    _replace_linear_fp8(pipe.dit)
+    torch.cuda.synchronize()
+    print(f"[fp8] quantized DiT linear layers in {time.perf_counter() - t0:.1f}s")
+
+
 def init_pipeline(device="cuda", dtype=torch.bfloat16, enable_vram_management=False):
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
@@ -478,6 +530,9 @@ def run_streaming(args):
     process_total_num = (meta.padded_frames - 1) // 8 - 2
     topk_ratio = args.sparse_ratio * 768 * 1280 / (meta.target_height * meta.target_width)
     dit_runner = build_dit_runner(pipe, args)
+
+    if args.fp8:
+        apply_fp8_quantization(pipe)
 
     if not args.skip_warmup:
         warmup_pipeline(pipe, meta, dit_runner, topk_ratio)
@@ -759,6 +814,8 @@ def parse_args():
     parser.add_argument("--disable-async-writer", action="store_true")
     parser.add_argument("--skip-warmup", action="store_true",
                         help="skip CUDA warmup pass (useful to measure raw JIT overhead)")
+    parser.add_argument("--fp8", action="store_true",
+                        help="quantize DiT linear layers to FP8 via torch._scaled_mm (Hopper only)")
     return parser.parse_args()
 
 
