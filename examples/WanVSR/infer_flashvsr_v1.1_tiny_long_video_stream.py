@@ -309,6 +309,45 @@ def concat_lq_latents(prev, cur):
     return prev
 
 
+def build_dit_runner(pipe, args):
+    def dit_runner(cur_latents, lq_latents, pre_cache_k, pre_cache_v, cur_process_idx, topk_ratio):
+        return model_fn_wan_video(
+            pipe.dit,
+            x=cur_latents,
+            timestep=pipe.timestep,
+            context=None,
+            tea_cache=None,
+            use_unified_sequence_parallel=False,
+            LQ_latents=lq_latents,
+            is_full_block=False,
+            is_stream=True,
+            pre_cache_k=pre_cache_k,
+            pre_cache_v=pre_cache_v,
+            topk_ratio=topk_ratio,
+            kv_ratio=args.kv_ratio,
+            cur_process_idx=cur_process_idx,
+            t_mod=pipe.t_mod,
+            t=pipe.t,
+            local_range=args.local_range,
+        )
+
+    if not args.torch_compile:
+        return dit_runner
+
+    compile_kwargs = {}
+    if args.torch_compile_mode:
+        compile_kwargs["mode"] = args.torch_compile_mode
+    if args.torch_compile_backend:
+        compile_kwargs["backend"] = args.torch_compile_backend
+
+    print(
+        f"[torch.compile] enabled target=model_fn_wan_video "
+        f"mode={compile_kwargs.get('mode', 'default')} "
+        f"backend={compile_kwargs.get('backend', 'default')}"
+    )
+    return torch.compile(dit_runner, **compile_kwargs)
+
+
 def run_streaming(args):
     dtype = torch.bfloat16
     reader = StreamingVideoFrames(args.input, scale=args.scale, dtype=dtype)
@@ -341,6 +380,7 @@ def run_streaming(args):
     latents = noise
     process_total_num = (meta.padded_frames - 1) // 8 - 2
     topk_ratio = args.sparse_ratio * 768 * 1280 / (meta.target_height * meta.target_width)
+    dit_runner = build_dit_runner(pipe, args)
 
     pre_cache_k = None
     pre_cache_v = None
@@ -400,24 +440,8 @@ def run_streaming(args):
 
                 with record_function("flashvsr_dit"):
                     t0 = time.perf_counter()
-                    noise_pred_posi, pre_cache_k, pre_cache_v = model_fn_wan_video(
-                        pipe.dit,
-                        x=cur_latents,
-                        timestep=pipe.timestep,
-                        context=None,
-                        tea_cache=None,
-                        use_unified_sequence_parallel=False,
-                        LQ_latents=lq_latents,
-                        is_full_block=False,
-                        is_stream=True,
-                        pre_cache_k=pre_cache_k,
-                        pre_cache_v=pre_cache_v,
-                        topk_ratio=topk_ratio,
-                        kv_ratio=args.kv_ratio,
-                        cur_process_idx=cur_process_idx,
-                        t_mod=pipe.t_mod,
-                        t=pipe.t,
-                        local_range=args.local_range,
+                    noise_pred_posi, pre_cache_k, pre_cache_v = dit_runner(
+                        cur_latents, lq_latents, pre_cache_k, pre_cache_v, cur_process_idx, topk_ratio
                     )
                     chunk_profile.dit_time += time.perf_counter() - t0
 
@@ -602,6 +626,9 @@ def parse_args():
     parser.add_argument("--profile-chunk-index", type=int, default=1)
     parser.add_argument("--profile-row-limit", type=int, default=30)
     parser.add_argument("--profile-trace", default=None)
+    parser.add_argument("--torch-compile", action="store_true")
+    parser.add_argument("--torch-compile-mode", default="reduce-overhead")
+    parser.add_argument("--torch-compile-backend", default="inductor")
     return parser.parse_args()
 
 
