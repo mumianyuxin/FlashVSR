@@ -89,7 +89,6 @@ class ChunkProfile:
     dit_time: float = 0.0
     decode_time: float = 0.0
     color_fix_time: float = 0.0
-    to_uint8_time: float = 0.0
     write_time: float = 0.0
     total_time: float = 0.0
 
@@ -115,7 +114,6 @@ class RunProfile:
             "dit": self._avg([c.dit_time for c in source]),
             "decode": self._avg([c.decode_time for c in source]),
             "color_fix": self._avg([c.color_fix_time for c in source]),
-            "to_uint8": self._avg([c.to_uint8_time for c in source]),
             "write": self._avg([c.write_time for c in source]),
             "total": self._avg([c.total_time for c in source]),
         }
@@ -405,6 +403,48 @@ def build_dit_runner(pipe, args):
     return torch.compile(dit_runner, **compile_kwargs)
 
 
+def warmup_pipeline(pipe, meta, dit_runner, topk_ratio):
+    """Run dummy forward passes to trigger CUDA kernel JIT compilation before the timed loop."""
+    device = pipe.device
+    dtype = pipe.torch_dtype
+    lH = meta.target_height // 16
+    lW = meta.target_width // 16
+
+    print(f"[warmup] starting at {meta.target_width}x{meta.target_height} ...")
+    t_start = time.perf_counter()
+    with torch.inference_mode():
+        dummy_lq = torch.zeros(1, 3, 4, meta.target_height, meta.target_width, device=device, dtype=dtype)
+
+        # warm up lq_proj: clip_idx=0 returns None, clips 1-6 run both conv layers
+        lq_wm = None
+        for _ in range(7):
+            cur = pipe.denoising_model().LQ_proj_in.stream_forward(dummy_lq)
+            lq_wm = concat_lq_latents(lq_wm, cur)
+
+        # warm up first-chunk DiT (6 latent frames, no pre_cache)
+        dummy_x0 = torch.zeros(1, 16, 6, lH, lW, device=device, dtype=dtype)
+        wm_k = [None] * len(pipe.dit.blocks)
+        wm_v = [None] * len(pipe.dit.blocks)
+        _, wm_k, wm_v = dit_runner(dummy_x0, lq_wm, wm_k, wm_v, 0, topk_ratio)
+
+        # warm up steady lq_proj (2 clips)
+        lq_wm2 = None
+        for _ in range(2):
+            cur = pipe.denoising_model().LQ_proj_in.stream_forward(dummy_lq)
+            lq_wm2 = concat_lq_latents(lq_wm2, cur)
+
+        # warm up steady DiT (2 latent frames, with populated pre_cache)
+        dummy_x1 = torch.zeros(1, 16, 2, lH, lW, device=device, dtype=dtype)
+        dit_runner(dummy_x1, lq_wm2, wm_k, wm_v, 1, topk_ratio)
+
+    torch.cuda.synchronize()
+    pipe.denoising_model().LQ_proj_in.clear_cache()
+    pipe.TCDecoder.clean_mem()
+    del dummy_lq, dummy_x0, dummy_x1, wm_k, wm_v, lq_wm, lq_wm2
+    torch.cuda.empty_cache()
+    print(f"[warmup] done in {time.perf_counter() - t_start:.1f}s")
+
+
 def run_streaming(args):
     dtype = torch.bfloat16
     use_pinned_memory = args.pin_memory and args.device.startswith("cuda")
@@ -427,7 +467,6 @@ def run_streaming(args):
     if hasattr(pipe.dit, "LQ_proj_in"):
         pipe.dit.LQ_proj_in.clear_cache()
     pipe.TCDecoder.clean_mem()
-    torch.cuda.reset_peak_memory_stats()
 
     noise = pipe.generate_noise(
         (1, 16, (meta.padded_frames - 1) // 4, meta.target_height // 8, meta.target_width // 8),
@@ -440,6 +479,10 @@ def run_streaming(args):
     topk_ratio = args.sparse_ratio * 768 * 1280 / (meta.target_height * meta.target_width)
     dit_runner = build_dit_runner(pipe, args)
 
+    if not args.skip_warmup:
+        warmup_pipeline(pipe, meta, dit_runner, topk_ratio)
+
+    torch.cuda.reset_peak_memory_stats()
     pre_cache_k = None
     pre_cache_v = None
     frames_written = 0
@@ -540,46 +583,47 @@ def run_streaming(args):
                     except Exception as exc:
                         print(f"[warning] color_fix failed on chunk {cur_process_idx}: {exc}")
 
-                with record_function("flashvsr_to_uint8"):
-                    t0 = time.perf_counter()
-                    out_frames_gpu = tensor_to_uint8_frames_gpu(cur_frames[0])
-                    chunk_profile.to_uint8_time += time.perf_counter() - t0
+                n_frames = cur_frames.shape[2]
                 with record_function("flashvsr_write"):
                     t1 = time.perf_counter()
                     if copy_stream is not None:
-                        cpu_frames = torch.empty_like(out_frames_gpu, device="cpu", pin_memory=True)
+                        # Move to_uint8 and DtoH copy onto copy_stream so the main stream is
+                        # not blocked by the saturated CUDA kernel queue after DiT+decode.
+                        cur_frames_c = cur_frames[0].contiguous()
                         current_stream = torch.cuda.current_stream(pipe.device)
                         copy_stream.wait_stream(current_stream)
                         with torch.cuda.stream(copy_stream):
+                            out_frames_gpu = tensor_to_uint8_frames_gpu(cur_frames_c)
+                            cpu_frames = torch.empty_like(out_frames_gpu, device="cpu", pin_memory=True)
                             cpu_frames.copy_(out_frames_gpu, non_blocking=True)
                             ready_event = torch.cuda.Event()
                             ready_event.record(copy_stream)
                         writer.submit(cpu_frames, ready_event)
                     else:
+                        out_frames_gpu = tensor_to_uint8_frames_gpu(cur_frames[0])
                         cpu_frames = out_frames_gpu.cpu()
                         class _Ready:
                             def synchronize(self_inner):
                                 return None
                         writer.submit(cpu_frames, _Ready())
                     chunk_profile.write_time += time.perf_counter() - t1
-                frames_written += len(out_frames_gpu)
+                frames_written += n_frames
 
                 chunk_time = time.perf_counter() - chunk_start
                 chunk_profile.total_time = chunk_time
                 run_profile.add(chunk_profile)
                 chunk_times.append(chunk_time)
-                chunk_fps = len(out_frames) / chunk_time if chunk_time > 0 else float("inf")
+                chunk_fps = n_frames / chunk_time if chunk_time > 0 else float("inf")
                 label = "first" if cur_process_idx == 0 else "steady"
                 print(
                     f"[stream] chunk={cur_process_idx:04d} type={label} "
-                    f"frames={len(out_frames)} input_until={plan.lq_cur_idx} "
+                    f"frames={n_frames} input_until={plan.lq_cur_idx} "
                     f"time={chunk_time:.3f}s fps={chunk_fps:.2f} "
                     f"read={chunk_profile.read_time:.3f}s "
                     f"lq={chunk_profile.lq_proj_time:.3f}s "
                     f"dit={chunk_profile.dit_time:.3f}s "
                     f"decode={chunk_profile.decode_time:.3f}s "
                     f"color={chunk_profile.color_fix_time:.3f}s "
-                    f"to_u8={chunk_profile.to_uint8_time:.3f}s "
                     f"write={chunk_profile.write_time:.3f}s"
                 )
                 if prof_ctx is not None:
@@ -593,7 +637,7 @@ def run_streaming(args):
                         prof_ctx.export_chrome_trace(args.profile_trace)
                         profiler_trace = args.profile_trace
 
-                del cur_lq_frame, cur_frames, out_frames_gpu, noise_pred_posi, lq_latents
+                del cur_lq_frame, cur_frames, noise_pred_posi, lq_latents
     finally:
         writer.close()
         reader.close()
@@ -617,7 +661,6 @@ def run_streaming(args):
             f"dit={stage_summary['dit']:.3f}s "
             f"decode={stage_summary['decode']:.3f}s "
             f"color={stage_summary['color_fix']:.3f}s "
-            f"to_u8={stage_summary['to_uint8']:.3f}s "
             f"write={stage_summary['write']:.3f}s "
             f"total={stage_summary['total']:.3f}s"
         )
@@ -708,12 +751,14 @@ def parse_args():
     parser.add_argument("--profile-row-limit", type=int, default=30)
     parser.add_argument("--profile-trace", default=None)
     parser.add_argument("--torch-compile", action="store_true")
-    parser.add_argument("--torch-compile-mode", default="reduce-overhead")
+    parser.add_argument("--torch-compile-mode", default="max-autotune")
     parser.add_argument("--torch-compile-backend", default="inductor")
     parser.set_defaults(pin_memory=True)
     parser.add_argument("--pin-memory", dest="pin_memory", action="store_true")
     parser.add_argument("--no-pin-memory", dest="pin_memory", action="store_false")
     parser.add_argument("--disable-async-writer", action="store_true")
+    parser.add_argument("--skip-warmup", action="store_true",
+                        help="skip CUDA warmup pass (useful to measure raw JIT overhead)")
     return parser.parse_args()
 
 
