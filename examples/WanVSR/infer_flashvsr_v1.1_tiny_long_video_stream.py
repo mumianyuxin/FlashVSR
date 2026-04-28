@@ -11,6 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 import imageio
 import numpy as np
 import torch
+from torch.profiler import ProfilerActivity, profile, record_function
 from einops import rearrange
 from PIL import Image
 
@@ -349,11 +350,21 @@ def run_streaming(args):
 
     writer = imageio.get_writer(args.output, fps=meta.fps, quality=args.quality)
     run_profile = RunProfile()
+    profiler_table = None
+    profiler_trace = None
     try:
         with torch.inference_mode():
             for cur_process_idx in range(process_total_num):
                 chunk_start = time.perf_counter()
                 chunk_profile = ChunkProfile()
+                target_profile = args.torch_profile and cur_process_idx == args.profile_chunk_index
+                prof_ctx = profile(
+                    activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                    record_shapes=True,
+                    profile_memory=True,
+                ) if target_profile else None
+                if prof_ctx is not None:
+                    prof_ctx.__enter__()
                 plan = build_chunk_plan(cur_process_idx)
 
                 t0 = time.perf_counter()
@@ -370,75 +381,82 @@ def run_streaming(args):
                     pre_cache_k = [None] * len(pipe.dit.blocks)
                     pre_cache_v = [None] * len(pipe.dit.blocks)
                     lq_latents = None
-                    for lq_clip in prefetched["stream_clips"]:
-                        t1 = time.perf_counter()
-                        cur = pipe.denoising_model().LQ_proj_in.stream_forward(lq_clip.to(pipe.device))
-                        chunk_profile.lq_proj_time += time.perf_counter() - t1
-                        lq_latents = concat_lq_latents(lq_latents, cur)
+                    with record_function("flashvsr_lq_proj"):
+                        for lq_clip in prefetched["stream_clips"]:
+                            t1 = time.perf_counter()
+                            cur = pipe.denoising_model().LQ_proj_in.stream_forward(lq_clip.to(pipe.device))
+                            chunk_profile.lq_proj_time += time.perf_counter() - t1
+                            lq_latents = concat_lq_latents(lq_latents, cur)
                     cur_latents = latents[:, :, plan.output_latent_start:plan.output_latent_end, :, :]
                 else:
                     lq_latents = None
-                    for lq_clip in prefetched["stream_clips"]:
-                        t1 = time.perf_counter()
-                        cur = pipe.denoising_model().LQ_proj_in.stream_forward(lq_clip.to(pipe.device))
-                        chunk_profile.lq_proj_time += time.perf_counter() - t1
-                        lq_latents = concat_lq_latents(lq_latents, cur)
+                    with record_function("flashvsr_lq_proj"):
+                        for lq_clip in prefetched["stream_clips"]:
+                            t1 = time.perf_counter()
+                            cur = pipe.denoising_model().LQ_proj_in.stream_forward(lq_clip.to(pipe.device))
+                            chunk_profile.lq_proj_time += time.perf_counter() - t1
+                            lq_latents = concat_lq_latents(lq_latents, cur)
                     cur_latents = latents[:, :, plan.output_latent_start:plan.output_latent_end, :, :]
 
-                t0 = time.perf_counter()
-                noise_pred_posi, pre_cache_k, pre_cache_v = model_fn_wan_video(
-                    pipe.dit,
-                    x=cur_latents,
-                    timestep=pipe.timestep,
-                    context=None,
-                    tea_cache=None,
-                    use_unified_sequence_parallel=False,
-                    LQ_latents=lq_latents,
-                    is_full_block=False,
-                    is_stream=True,
-                    pre_cache_k=pre_cache_k,
-                    pre_cache_v=pre_cache_v,
-                    topk_ratio=topk_ratio,
-                    kv_ratio=args.kv_ratio,
-                    cur_process_idx=cur_process_idx,
-                    t_mod=pipe.t_mod,
-                    t=pipe.t,
-                    local_range=args.local_range,
-                )
-                chunk_profile.dit_time += time.perf_counter() - t0
+                with record_function("flashvsr_dit"):
+                    t0 = time.perf_counter()
+                    noise_pred_posi, pre_cache_k, pre_cache_v = model_fn_wan_video(
+                        pipe.dit,
+                        x=cur_latents,
+                        timestep=pipe.timestep,
+                        context=None,
+                        tea_cache=None,
+                        use_unified_sequence_parallel=False,
+                        LQ_latents=lq_latents,
+                        is_full_block=False,
+                        is_stream=True,
+                        pre_cache_k=pre_cache_k,
+                        pre_cache_v=pre_cache_v,
+                        topk_ratio=topk_ratio,
+                        kv_ratio=args.kv_ratio,
+                        cur_process_idx=cur_process_idx,
+                        t_mod=pipe.t_mod,
+                        t=pipe.t,
+                        local_range=args.local_range,
+                    )
+                    chunk_profile.dit_time += time.perf_counter() - t0
 
                 cur_latents = cur_latents - noise_pred_posi
                 cur_lq_frame = prefetched["cond"].to(pipe.device)
-                t1 = time.perf_counter()
-                cur_frames = pipe.TCDecoder.decode_video(
-                    cur_latents.transpose(1, 2),
-                    parallel=False,
-                    show_progress_bar=False,
-                    cond=cur_lq_frame,
-                ).transpose(1, 2).mul_(2).sub_(1)
-                chunk_profile.decode_time += time.perf_counter() - t1
+                with record_function("flashvsr_decode"):
+                    t1 = time.perf_counter()
+                    cur_frames = pipe.TCDecoder.decode_video(
+                        cur_latents.transpose(1, 2),
+                        parallel=False,
+                        show_progress_bar=False,
+                        cond=cur_lq_frame,
+                    ).transpose(1, 2).mul_(2).sub_(1)
+                    chunk_profile.decode_time += time.perf_counter() - t1
 
                 if not args.no_color_fix:
                     try:
-                        t0 = time.perf_counter()
-                        cur_frames = pipe.ColorCorrector(
-                            cur_frames.to(device=pipe.device),
-                            cur_lq_frame,
-                            clip_range=(-1, 1),
-                            chunk_size=None,
-                            method="adain",
-                        )
-                        chunk_profile.color_fix_time += time.perf_counter() - t0
+                        with record_function("flashvsr_color_fix"):
+                            t0 = time.perf_counter()
+                            cur_frames = pipe.ColorCorrector(
+                                cur_frames.to(device=pipe.device),
+                                cur_lq_frame,
+                                clip_range=(-1, 1),
+                                chunk_size=None,
+                                method="adain",
+                            )
+                            chunk_profile.color_fix_time += time.perf_counter() - t0
                     except Exception as exc:
                         print(f"[warning] color_fix failed on chunk {cur_process_idx}: {exc}")
 
-                t0 = time.perf_counter()
-                out_frames = tensor_to_uint8_frames(cur_frames[0])
-                chunk_profile.to_uint8_time += time.perf_counter() - t0
-                t1 = time.perf_counter()
-                for frame in out_frames:
-                    writer.append_data(frame)
-                chunk_profile.write_time += time.perf_counter() - t1
+                with record_function("flashvsr_to_uint8"):
+                    t0 = time.perf_counter()
+                    out_frames = tensor_to_uint8_frames(cur_frames[0])
+                    chunk_profile.to_uint8_time += time.perf_counter() - t0
+                with record_function("flashvsr_write"):
+                    t1 = time.perf_counter()
+                    for frame in out_frames:
+                        writer.append_data(frame)
+                    chunk_profile.write_time += time.perf_counter() - t1
                 frames_written += len(out_frames)
 
                 chunk_time = time.perf_counter() - chunk_start
@@ -459,6 +477,16 @@ def run_streaming(args):
                     f"to_u8={chunk_profile.to_uint8_time:.3f}s "
                     f"write={chunk_profile.write_time:.3f}s"
                 )
+                if prof_ctx is not None:
+                    torch.cuda.synchronize()
+                    prof_ctx.__exit__(None, None, None)
+                    profiler_table = prof_ctx.key_averages().table(
+                        sort_by="self_cuda_time_total",
+                        row_limit=args.profile_row_limit,
+                    )
+                    if args.profile_trace:
+                        prof_ctx.export_chrome_trace(args.profile_trace)
+                        profiler_trace = args.profile_trace
 
                 del cur_lq_frame, cur_frames, out_frames, noise_pred_posi, lq_latents
     finally:
@@ -488,6 +516,11 @@ def run_streaming(args):
             f"write={stage_summary['write']:.3f}s "
             f"total={stage_summary['total']:.3f}s"
         )
+    if profiler_table:
+        print("[torch.profiler]")
+        print(profiler_table)
+        if profiler_trace:
+            print(f"[torch.profiler.trace] {profiler_trace}")
     return args.output
 
 
@@ -565,6 +598,10 @@ def parse_args():
     parser.add_argument("--vram-management", action="store_true")
     parser.add_argument("--compare-baseline", default=None)
     parser.add_argument("--psnr-threshold", type=float, default=40.0)
+    parser.add_argument("--torch-profile", action="store_true")
+    parser.add_argument("--profile-chunk-index", type=int, default=1)
+    parser.add_argument("--profile-row-limit", type=int, default=30)
+    parser.add_argument("--profile-trace", default=None)
     return parser.parse_args()
 
 
