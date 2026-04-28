@@ -5,7 +5,7 @@ import argparse
 import math
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import imageio
 import numpy as np
@@ -78,6 +78,45 @@ class VideoMeta:
     padded_frames: int
     output_frames: int
     fps: int
+
+
+@dataclass
+class ChunkProfile:
+    read_time: float = 0.0
+    lq_proj_time: float = 0.0
+    dit_time: float = 0.0
+    decode_time: float = 0.0
+    color_fix_time: float = 0.0
+    to_uint8_time: float = 0.0
+    write_time: float = 0.0
+    total_time: float = 0.0
+
+
+@dataclass
+class RunProfile:
+    chunks: list[ChunkProfile] = field(default_factory=list)
+
+    def add(self, chunk: ChunkProfile):
+        self.chunks.append(chunk)
+
+    def _avg(self, values):
+        return sum(values) / len(values) if values else 0.0
+
+    def summary(self):
+        if not self.chunks:
+            return {}
+        steady = self.chunks[1:] if len(self.chunks) > 1 else []
+        source = steady if steady else self.chunks
+        return {
+            "read": self._avg([c.read_time for c in source]),
+            "lq_proj": self._avg([c.lq_proj_time for c in source]),
+            "dit": self._avg([c.dit_time for c in source]),
+            "decode": self._avg([c.decode_time for c in source]),
+            "color_fix": self._avg([c.color_fix_time for c in source]),
+            "to_uint8": self._avg([c.to_uint8_time for c in source]),
+            "write": self._avg([c.write_time for c in source]),
+            "total": self._avg([c.total_time for c in source]),
+        }
 
 
 class StreamingVideoFrames:
@@ -165,6 +204,10 @@ class StreamingVideoFrames:
 
 
 def init_pipeline(device="cuda", dtype=torch.bfloat16, enable_vram_management=False):
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
+    torch.set_float32_matmul_precision("high")
     print(torch.cuda.current_device(), torch.cuda.get_device_name(torch.cuda.current_device()))
     mm = ModelManager(torch_dtype=dtype, device="cpu")
     mm.load_models([
@@ -240,10 +283,12 @@ def run_streaming(args):
     total_start = time.perf_counter()
 
     writer = imageio.get_writer(args.output, fps=meta.fps, quality=args.quality)
+    run_profile = RunProfile()
     try:
-        with torch.no_grad():
+        with torch.inference_mode():
             for cur_process_idx in range(process_total_num):
                 chunk_start = time.perf_counter()
+                chunk_profile = ChunkProfile()
                 if cur_process_idx == 0:
                     pre_cache_k = [None] * len(pipe.dit.blocks)
                     pre_cache_v = [None] * len(pipe.dit.blocks)
@@ -252,8 +297,12 @@ def run_streaming(args):
                     for inner_idx in range(inner_loop_num):
                         start = max(0, inner_idx * 4 - 3)
                         end = (inner_idx + 1) * 4 - 3
+                        t0 = time.perf_counter()
                         lq_clip = reader.get_slice(start, end)
+                        chunk_profile.read_time += time.perf_counter() - t0
+                        t1 = time.perf_counter()
                         cur = pipe.denoising_model().LQ_proj_in.stream_forward(lq_clip.to(pipe.device))
+                        chunk_profile.lq_proj_time += time.perf_counter() - t1
                         lq_latents = concat_lq_latents(lq_latents, cur)
                     lq_cur_idx = (inner_loop_num - 1) * 4 - 3
                     cur_latents = latents[:, :, :6, :, :]
@@ -263,12 +312,17 @@ def run_streaming(args):
                     for inner_idx in range(inner_loop_num):
                         start = cur_process_idx * 8 + 17 + inner_idx * 4
                         end = cur_process_idx * 8 + 21 + inner_idx * 4
+                        t0 = time.perf_counter()
                         lq_clip = reader.get_slice(start, end)
+                        chunk_profile.read_time += time.perf_counter() - t0
+                        t1 = time.perf_counter()
                         cur = pipe.denoising_model().LQ_proj_in.stream_forward(lq_clip.to(pipe.device))
+                        chunk_profile.lq_proj_time += time.perf_counter() - t1
                         lq_latents = concat_lq_latents(lq_latents, cur)
                     lq_cur_idx = cur_process_idx * 8 + 21 + (inner_loop_num - 2) * 4
                     cur_latents = latents[:, :, 4 + cur_process_idx * 2:6 + cur_process_idx * 2, :, :]
 
+                t0 = time.perf_counter()
                 noise_pred_posi, pre_cache_k, pre_cache_v = model_fn_wan_video(
                     pipe.dit,
                     x=cur_latents,
@@ -288,18 +342,24 @@ def run_streaming(args):
                     t=pipe.t,
                     local_range=args.local_range,
                 )
+                chunk_profile.dit_time += time.perf_counter() - t0
 
                 cur_latents = cur_latents - noise_pred_posi
+                t0 = time.perf_counter()
                 cur_lq_frame = reader.get_slice(lq_pre_idx, lq_cur_idx).to(pipe.device)
+                chunk_profile.read_time += time.perf_counter() - t0
+                t1 = time.perf_counter()
                 cur_frames = pipe.TCDecoder.decode_video(
                     cur_latents.transpose(1, 2),
                     parallel=False,
                     show_progress_bar=False,
                     cond=cur_lq_frame,
                 ).transpose(1, 2).mul_(2).sub_(1)
+                chunk_profile.decode_time += time.perf_counter() - t1
 
                 if not args.no_color_fix:
                     try:
+                        t0 = time.perf_counter()
                         cur_frames = pipe.ColorCorrector(
                             cur_frames.to(device=pipe.device),
                             cur_lq_frame,
@@ -307,24 +367,38 @@ def run_streaming(args):
                             chunk_size=None,
                             method="adain",
                         )
+                        chunk_profile.color_fix_time += time.perf_counter() - t0
                     except Exception as exc:
                         print(f"[warning] color_fix failed on chunk {cur_process_idx}: {exc}")
 
+                t0 = time.perf_counter()
                 out_frames = tensor_to_uint8_frames(cur_frames[0])
+                chunk_profile.to_uint8_time += time.perf_counter() - t0
+                t1 = time.perf_counter()
                 for frame in out_frames:
                     writer.append_data(frame)
+                chunk_profile.write_time += time.perf_counter() - t1
                 frames_written += len(out_frames)
 
                 lq_pre_idx = lq_cur_idx
                 reader.release_before(lq_pre_idx)
                 chunk_time = time.perf_counter() - chunk_start
+                chunk_profile.total_time = chunk_time
+                run_profile.add(chunk_profile)
                 chunk_times.append(chunk_time)
                 chunk_fps = len(out_frames) / chunk_time if chunk_time > 0 else float("inf")
                 label = "first" if cur_process_idx == 0 else "steady"
                 print(
                     f"[stream] chunk={cur_process_idx:04d} type={label} "
                     f"frames={len(out_frames)} input_until={lq_cur_idx} "
-                    f"time={chunk_time:.3f}s fps={chunk_fps:.2f}"
+                    f"time={chunk_time:.3f}s fps={chunk_fps:.2f} "
+                    f"read={chunk_profile.read_time:.3f}s "
+                    f"lq={chunk_profile.lq_proj_time:.3f}s "
+                    f"dit={chunk_profile.dit_time:.3f}s "
+                    f"decode={chunk_profile.decode_time:.3f}s "
+                    f"color={chunk_profile.color_fix_time:.3f}s "
+                    f"to_u8={chunk_profile.to_uint8_time:.3f}s "
+                    f"write={chunk_profile.write_time:.3f}s"
                 )
 
                 del cur_lq_frame, cur_frames, out_frames, noise_pred_posi, lq_latents
@@ -337,11 +411,23 @@ def run_streaming(args):
     steady = chunk_times[1:] if len(chunk_times) > 1 else []
     steady_avg = sum(steady) / len(steady) if steady else 0.0
     peak_gb = torch.cuda.max_memory_allocated() / (1024 ** 3)
+    stage_summary = run_profile.summary()
     print(
         f"[summary] wrote={frames_written} frames total_time={total_time:.3f}s "
         f"avg_fps={avg_fps:.2f} first_latency={chunk_times[0]:.3f}s "
         f"steady_chunk_avg={steady_avg:.3f}s peak_mem={peak_gb:.2f}GiB"
     )
+    if stage_summary:
+        print(
+            f"[summary.steady] read={stage_summary['read']:.3f}s "
+            f"lq={stage_summary['lq_proj']:.3f}s "
+            f"dit={stage_summary['dit']:.3f}s "
+            f"decode={stage_summary['decode']:.3f}s "
+            f"color={stage_summary['color_fix']:.3f}s "
+            f"to_u8={stage_summary['to_uint8']:.3f}s "
+            f"write={stage_summary['write']:.3f}s "
+            f"total={stage_summary['total']:.3f}s"
+        )
     return args.output
 
 
