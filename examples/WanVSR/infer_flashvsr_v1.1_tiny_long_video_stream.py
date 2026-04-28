@@ -336,7 +336,10 @@ class _FP8Linear(torch.nn.Module):
         w = linear.weight.detach().float()                              # [out, in]
         scale_w = w.abs().max().clamp(min=1e-12) / 448.0
         w_fp8 = (w / scale_w).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
-        self.register_buffer("weight_fp8_T", w_fp8.T.contiguous())     # [in, out]
+        # cuBLASLt FP8 GEMM: A=row-major, B=column-major.
+        # Passing weight [out, in] as row-major makes cuBLASLt treat it as
+        # column-major [in, out], so _scaled_mm(x, weight) computes x @ weight.T
+        self.register_buffer("weight_fp8", w_fp8.contiguous())         # [out, in]
         self.register_buffer("scale_w", scale_w.float().view(1))
         if linear.bias is not None:
             self.register_buffer("bias", linear.bias.detach().clone())
@@ -350,8 +353,10 @@ class _FP8Linear(torch.nn.Module):
         x_2d = x.reshape(-1, self.in_features)
         scale_x = x_2d.abs().max().float().clamp(min=1e-12).view(1) / 448.0
         x_fp8 = x_2d.to(torch.float32).div_(scale_x).clamp_(-448.0, 448.0).to(torch.float8_e4m3fn)
+        # x_fp8: [N, in] row-major;  weight_fp8: [out, in] row-major (= col-major [in, out])
+        # result: x_fp8 @ weight_fp8.T = [N, out]
         out = torch._scaled_mm(
-            x_fp8, self.weight_fp8_T,
+            x_fp8, self.weight_fp8,
             scale_a=scale_x, scale_b=self.scale_w,
             out_dtype=x.dtype, use_fast_accum=True,
         )
