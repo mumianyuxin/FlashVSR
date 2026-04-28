@@ -351,6 +351,8 @@ class _FP8Linear(torch.nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         orig_shape = x.shape
         x_2d = x.reshape(-1, self.in_features)
+        if not x_2d.is_contiguous():
+            x_2d = x_2d.contiguous()
         scale_x = x_2d.abs().max().float().clamp(min=1e-12).view(1) / 448.0
         x_fp8 = x_2d.to(torch.float32).div_(scale_x).clamp_(-448.0, 448.0).to(torch.float8_e4m3fn)
         # x_fp8: [N, in] C-contiguous (row-major); weight_fp8.T: [in, out] F-contiguous
