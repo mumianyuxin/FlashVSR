@@ -6,6 +6,7 @@ import math
 import os
 import time
 from dataclasses import dataclass, field
+from concurrent.futures import ThreadPoolExecutor
 
 import imageio
 import numpy as np
@@ -119,6 +120,15 @@ class RunProfile:
         }
 
 
+@dataclass(frozen=True)
+class ChunkPlan:
+    stream_slices: list[tuple[int, int]]
+    cond_slice: tuple[int, int]
+    lq_cur_idx: int
+    output_latent_start: int
+    output_latent_end: int
+
+
 class StreamingVideoFrames:
     def __init__(self, path, scale=2.0, dtype=torch.bfloat16):
         if not is_video(path):
@@ -203,6 +213,61 @@ class StreamingVideoFrames:
         self.cache.clear()
 
 
+def build_chunk_plan(cur_process_idx):
+    if cur_process_idx == 0:
+        stream_slices = [(max(0, inner_idx * 4 - 3), (inner_idx + 1) * 4 - 3) for inner_idx in range(7)]
+        return ChunkPlan(
+            stream_slices=stream_slices,
+            cond_slice=(0, 21),
+            lq_cur_idx=21,
+            output_latent_start=0,
+            output_latent_end=6,
+        )
+
+    base = cur_process_idx * 8
+    return ChunkPlan(
+        stream_slices=[(base + 17 + inner_idx * 4, base + 21 + inner_idx * 4) for inner_idx in range(2)],
+        cond_slice=(base + 13, base + 21),
+        lq_cur_idx=base + 21,
+        output_latent_start=4 + cur_process_idx * 2,
+        output_latent_end=6 + cur_process_idx * 2,
+    )
+
+
+def load_chunk_inputs(reader, plan):
+    stream_clips = [reader.get_slice(start, end) for start, end in plan.stream_slices]
+    cond = reader.get_slice(*plan.cond_slice)
+    reader.release_before(plan.cond_slice[1])
+    return {"stream_clips": stream_clips, "cond": cond}
+
+
+class ChunkPrefetcher:
+    def __init__(self, path, scale, dtype):
+        self.reader = StreamingVideoFrames(path, scale=scale, dtype=dtype)
+        self.executor = ThreadPoolExecutor(max_workers=1)
+        self.future = None
+        self.chunk_idx = None
+
+    def submit(self, chunk_idx, plan):
+        self.future = self.executor.submit(load_chunk_inputs, self.reader, plan)
+        self.chunk_idx = chunk_idx
+
+    def pop(self, chunk_idx):
+        if self.chunk_idx != chunk_idx or self.future is None:
+            return None
+        data = self.future.result()
+        self.future = None
+        self.chunk_idx = None
+        return data
+
+    def close(self):
+        if self.future is not None:
+            self.future.result()
+            self.future = None
+        self.executor.shutdown(wait=True)
+        self.reader.close()
+
+
 def init_pipeline(device="cuda", dtype=torch.bfloat16, enable_vram_management=False):
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
@@ -246,6 +311,7 @@ def concat_lq_latents(prev, cur):
 def run_streaming(args):
     dtype = torch.bfloat16
     reader = StreamingVideoFrames(args.input, scale=args.scale, dtype=dtype)
+    prefetcher = ChunkPrefetcher(args.input, scale=args.scale, dtype=dtype)
     meta = reader.meta
     print(
         f"[{os.path.basename(args.input)}] Original Resolution: {meta.width}x{meta.height} | "
@@ -277,7 +343,6 @@ def run_streaming(args):
 
     pre_cache_k = None
     pre_cache_v = None
-    lq_pre_idx = 0
     frames_written = 0
     chunk_times = []
     total_start = time.perf_counter()
@@ -289,38 +354,36 @@ def run_streaming(args):
             for cur_process_idx in range(process_total_num):
                 chunk_start = time.perf_counter()
                 chunk_profile = ChunkProfile()
+                plan = build_chunk_plan(cur_process_idx)
+
+                t0 = time.perf_counter()
+                prefetched = prefetcher.pop(cur_process_idx)
+                if prefetched is None:
+                    prefetched = load_chunk_inputs(reader, plan)
+                chunk_profile.read_time += time.perf_counter() - t0
+
+                next_process_idx = cur_process_idx + 1
+                if next_process_idx < process_total_num:
+                    prefetcher.submit(next_process_idx, build_chunk_plan(next_process_idx))
+
                 if cur_process_idx == 0:
                     pre_cache_k = [None] * len(pipe.dit.blocks)
                     pre_cache_v = [None] * len(pipe.dit.blocks)
                     lq_latents = None
-                    inner_loop_num = 7
-                    for inner_idx in range(inner_loop_num):
-                        start = max(0, inner_idx * 4 - 3)
-                        end = (inner_idx + 1) * 4 - 3
-                        t0 = time.perf_counter()
-                        lq_clip = reader.get_slice(start, end)
-                        chunk_profile.read_time += time.perf_counter() - t0
+                    for lq_clip in prefetched["stream_clips"]:
                         t1 = time.perf_counter()
                         cur = pipe.denoising_model().LQ_proj_in.stream_forward(lq_clip.to(pipe.device))
                         chunk_profile.lq_proj_time += time.perf_counter() - t1
                         lq_latents = concat_lq_latents(lq_latents, cur)
-                    lq_cur_idx = (inner_loop_num - 1) * 4 - 3
-                    cur_latents = latents[:, :, :6, :, :]
+                    cur_latents = latents[:, :, plan.output_latent_start:plan.output_latent_end, :, :]
                 else:
                     lq_latents = None
-                    inner_loop_num = 2
-                    for inner_idx in range(inner_loop_num):
-                        start = cur_process_idx * 8 + 17 + inner_idx * 4
-                        end = cur_process_idx * 8 + 21 + inner_idx * 4
-                        t0 = time.perf_counter()
-                        lq_clip = reader.get_slice(start, end)
-                        chunk_profile.read_time += time.perf_counter() - t0
+                    for lq_clip in prefetched["stream_clips"]:
                         t1 = time.perf_counter()
                         cur = pipe.denoising_model().LQ_proj_in.stream_forward(lq_clip.to(pipe.device))
                         chunk_profile.lq_proj_time += time.perf_counter() - t1
                         lq_latents = concat_lq_latents(lq_latents, cur)
-                    lq_cur_idx = cur_process_idx * 8 + 21 + (inner_loop_num - 2) * 4
-                    cur_latents = latents[:, :, 4 + cur_process_idx * 2:6 + cur_process_idx * 2, :, :]
+                    cur_latents = latents[:, :, plan.output_latent_start:plan.output_latent_end, :, :]
 
                 t0 = time.perf_counter()
                 noise_pred_posi, pre_cache_k, pre_cache_v = model_fn_wan_video(
@@ -345,9 +408,7 @@ def run_streaming(args):
                 chunk_profile.dit_time += time.perf_counter() - t0
 
                 cur_latents = cur_latents - noise_pred_posi
-                t0 = time.perf_counter()
-                cur_lq_frame = reader.get_slice(lq_pre_idx, lq_cur_idx).to(pipe.device)
-                chunk_profile.read_time += time.perf_counter() - t0
+                cur_lq_frame = prefetched["cond"].to(pipe.device)
                 t1 = time.perf_counter()
                 cur_frames = pipe.TCDecoder.decode_video(
                     cur_latents.transpose(1, 2),
@@ -380,8 +441,6 @@ def run_streaming(args):
                 chunk_profile.write_time += time.perf_counter() - t1
                 frames_written += len(out_frames)
 
-                lq_pre_idx = lq_cur_idx
-                reader.release_before(lq_pre_idx)
                 chunk_time = time.perf_counter() - chunk_start
                 chunk_profile.total_time = chunk_time
                 run_profile.add(chunk_profile)
@@ -390,7 +449,7 @@ def run_streaming(args):
                 label = "first" if cur_process_idx == 0 else "steady"
                 print(
                     f"[stream] chunk={cur_process_idx:04d} type={label} "
-                    f"frames={len(out_frames)} input_until={lq_cur_idx} "
+                    f"frames={len(out_frames)} input_until={plan.lq_cur_idx} "
                     f"time={chunk_time:.3f}s fps={chunk_fps:.2f} "
                     f"read={chunk_profile.read_time:.3f}s "
                     f"lq={chunk_profile.lq_proj_time:.3f}s "
@@ -405,6 +464,7 @@ def run_streaming(args):
     finally:
         writer.close()
         reader.close()
+        prefetcher.close()
 
     total_time = time.perf_counter() - total_start
     avg_fps = frames_written / total_time if total_time > 0 else 0.0
