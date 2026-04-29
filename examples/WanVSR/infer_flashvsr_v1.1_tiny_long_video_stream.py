@@ -541,6 +541,14 @@ def run_streaming(args):
     if args.fp8:
         apply_fp8_quantization(pipe)
 
+    if args.sage_attn:
+        import diffsynth.models.wan_video_dit as _dit_mod
+        if _dit_mod.SPARSE_SAGE_AVAILABLE:
+            _dit_mod.USE_BLOCK_ATTN = False
+            print("[sage-attn] enabled: using sparse_sageattn (INT8 Triton kernel)")
+        else:
+            print("[sage-attn] sparse_sageattn not available — falling back to block_sparse_attn")
+
     if not args.skip_warmup:
         warmup_pipeline(pipe, meta, dit_runner, topk_ratio)
 
@@ -823,6 +831,8 @@ def parse_args():
                         help="skip CUDA warmup pass (useful to measure raw JIT overhead)")
     parser.add_argument("--fp8", action="store_true",
                         help="quantize DiT linear layers to FP8 via torch._scaled_mm (Hopper only)")
+    parser.add_argument("--sage-attn", action="store_true",
+                        help="replace block_sparse_attn with sparse_sageattn (INT8 Triton kernel)")
     return parser.parse_args()
 
 

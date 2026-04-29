@@ -27,6 +27,15 @@ try:
 except ModuleNotFoundError:
     SAGE_ATTN_AVAILABLE = False
 
+try:
+    from .sparse_sage.core import sparse_sageattn
+    SPARSE_SAGE_AVAILABLE = True
+except Exception:
+    SPARSE_SAGE_AVAILABLE = False
+
+# Set to False (via --sage-attn flag) to switch from block_sparse_attn to sparse_sageattn.
+USE_BLOCK_ATTN = True
+
 from block_sparse_attn import block_sparse_attn_func
 from PIL import Image
 import numpy as np
@@ -154,6 +163,60 @@ def generate_draft_block_mask(batch_size, nheads, seqlen,
 
 
 @torch.no_grad()
+def generate_draft_block_mask_sage(batch_size, nheads, seqlen,
+                                   q_w, k_w, topk=10, local_attn_mask=None):
+    """Like generate_draft_block_mask but produces a mask compatible with sparse_sageattn.
+
+    sparse_sageattn uses BLKQ=128, BLKK=64.  Each k_w window (128 tokens) is split
+    into two 64-token sub-blocks so the mask has 2× as many K columns as the original.
+    """
+    assert batch_size == 1, "Only batch_size=1 supported for now"
+    assert local_attn_mask is not None, "local_attn_mask must be provided"
+
+    avgpool_q = torch.mean(q_w, dim=1)
+    avgpool_q = rearrange(avgpool_q, 's (h d) -> s h d', h=nheads)
+    q_heads = avgpool_q.permute(1, 0, 2)   # [h, s_q, d]
+    D = avgpool_q.shape[-1]
+
+    # Split each k_w block (128 tokens) into two 64-token halves for BLKK=64 granularity
+    k_w_split = k_w.view(k_w.shape[0], 2, 64, k_w.shape[2])   # [nblk, 2, 64, D]
+    avgpool_k_split = torch.mean(k_w_split, dim=2)              # [nblk, 2, D]
+    avgpool_k_doubled = rearrange(avgpool_k_split, 's two d -> (s two) d', two=2)
+    avgpool_k_doubled = rearrange(avgpool_k_doubled, 's (h d) -> s h d', h=nheads)
+    k_heads = avgpool_k_doubled.permute(1, 0, 2)                # [h, s_k*2, d]
+
+    k_heads_1, k_heads_2 = torch.chunk(k_heads, 2, dim=1)
+    scores_1 = torch.einsum("hld,hmd->hlm", q_heads, k_heads_1) / math.sqrt(D)
+    scores_2 = torch.einsum("hld,hmd->hlm", q_heads, k_heads_2) / math.sqrt(D)
+    scores = torch.cat([scores_1, scores_2], dim=-1)  # [h, s_q, s_k*2]
+
+    repeat_head = scores.shape[0]
+    repeat_len = scores.shape[1] // local_attn_mask.shape[0]
+    repeat_num = (scores.shape[2] // 2) // local_attn_mask.shape[1]
+    local_m = local_attn_mask.unsqueeze(1).unsqueeze(0).repeat(repeat_len, 1, repeat_num, 1)
+    local_m = rearrange(local_m, 'x a y b -> (x a) (y b)')
+    local_m = local_m.repeat_interleave(2, dim=1)               # expand to 2× K columns
+    local_m = local_m.unsqueeze(0).repeat(repeat_head, 1, 1)
+    local_m = local_m.to(torch.float32)
+    local_m = local_m.masked_fill(local_m == False, -float('inf'))
+    local_m = local_m.masked_fill(local_m == True, 0)
+    scores = scores + local_m
+
+    attn_map = torch.softmax(scores, dim=-1)
+    attn_map = rearrange(attn_map, 'h (it s1) s2 -> (h it) s1 s2', it=seqlen)
+    loop_num, s1, s2 = attn_map.shape
+    flat = attn_map.reshape(loop_num, -1)
+    apply_topk = min(flat.shape[1] - 1, topk * 2)  # 2× columns → 2× topk budget
+    if apply_topk <= 0:
+        mask_new = torch.zeros_like(flat, dtype=torch.bool).reshape(loop_num, s1, s2)
+    else:
+        thresholds = torch.topk(flat, k=apply_topk + 1, dim=1, largest=True).values[:, -1]
+        mask_new = (flat > thresholds.unsqueeze(1)).reshape(loop_num, s1, s2)
+    mask_new = rearrange(mask_new, '(h it) s1 s2 -> h (it s1) s2', it=seqlen)
+    return mask_new.unsqueeze(0).repeat(batch_size, 1, 1, 1)
+
+
+@torch.no_grad()
 def generate_causal_block_mask(batch_size, nheads, seqlen, local_num, window_size, device='cuda', train_img=False):
     i = torch.arange(seqlen, device=device).view(-1, 1)
     j = torch.arange(seqlen, device=device).view(1, -1)
@@ -175,32 +238,42 @@ def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads
     if attention_mask is not None:
         seqlen = q.shape[1]
         seqlen_kv = k.shape[1]
-        q = rearrange(q, "b s (n d) -> (b s) n d", n=num_heads)
-        k = rearrange(k, "b s (n d) -> (b s) n d", n=num_heads)
-        v = rearrange(v, "b s (n d) -> (b s) n d", n=num_heads)
-        cu_seqlens_q = torch.tensor([0, seqlen], device=q.device, dtype=torch.int32)
-        cu_seqlens_k = torch.tensor([0, seqlen_kv], device=q.device, dtype=torch.int32)
-        head_mask_type = torch.tensor([1]*num_heads, device=q.device, dtype=torch.int32)
-        streaming_info = None
-        base_blockmask = attention_mask
-        max_seqlen_q_ = seqlen
-        max_seqlen_k_ = seqlen_kv
-        p_dropout = 0.0
-        x = block_sparse_attn_func(
-            q, k, v,
-            cu_seqlens_q, cu_seqlens_k,
-            head_mask_type,
-            streaming_info,
-            base_blockmask,
-            max_seqlen_q_, max_seqlen_k_,
-            p_dropout,
-            deterministic=False,
-            softmax_scale=None,
-            is_causal=False,
-            exact_streaming=False,
-            return_attn_probs=False,
-        ).unsqueeze(0)
-        x = rearrange(x, "b s n d -> b s (n d)", n=num_heads)
+        if (not USE_BLOCK_ATTN) and SPARSE_SAGE_AVAILABLE:
+            # sparse_sageattn path: INT8 block-sparse attention with BLKQ=128, BLKK=64
+            # mask shape: [B, H, ceil(S_q/128), ceil(S_k/64)] — generated by generate_draft_block_mask_sage
+            q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
+            k = rearrange(k, "b s (n d) -> b n s d", n=num_heads)
+            v = rearrange(v, "b s (n d) -> b n s d", n=num_heads)
+            x = sparse_sageattn(
+                q, k, v,
+                mask_id=attention_mask.to(torch.int8),
+                is_causal=False,
+                tensor_layout="HND",
+            )
+            x = rearrange(x, "b n s d -> b s (n d)", n=num_heads)
+        else:
+            # block_sparse_attn path (default)
+            q = rearrange(q, "b s (n d) -> (b s) n d", n=num_heads)
+            k = rearrange(k, "b s (n d) -> (b s) n d", n=num_heads)
+            v = rearrange(v, "b s (n d) -> (b s) n d", n=num_heads)
+            cu_seqlens_q = torch.tensor([0, seqlen], device=q.device, dtype=torch.int32)
+            cu_seqlens_k = torch.tensor([0, seqlen_kv], device=q.device, dtype=torch.int32)
+            head_mask_type = torch.tensor([1]*num_heads, device=q.device, dtype=torch.int32)
+            x = block_sparse_attn_func(
+                q, k, v,
+                cu_seqlens_q, cu_seqlens_k,
+                head_mask_type,
+                None,                  # streaming_info
+                attention_mask,        # base_blockmask
+                seqlen, seqlen_kv,
+                0.0,                   # p_dropout
+                deterministic=False,
+                softmax_scale=None,
+                is_causal=False,
+                exact_streaming=False,
+                return_attn_probs=False,
+            ).unsqueeze(0)
+            x = rearrange(x, "b s n d -> b s (n d)", n=num_heads)
     elif compatibility_mode:
         q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
         k = rearrange(k, "b s (n d) -> b n s d", n=num_heads)
@@ -360,7 +433,10 @@ class SelfAttention(nn.Module):
             self.local_attn_mask_h = h//8
             self.local_attn_mask_w = w//8
             self.local_range = local_range
-        attention_mask = generate_draft_block_mask(B, self.num_heads, seqlen, q_w, k_w, topk=topk, local_attn_mask=self.local_attn_mask)
+        if (not USE_BLOCK_ATTN) and SPARSE_SAGE_AVAILABLE:
+            attention_mask = generate_draft_block_mask_sage(B, self.num_heads, seqlen, q_w, k_w, topk=topk, local_attn_mask=self.local_attn_mask)
+        else:
+            attention_mask = generate_draft_block_mask(B, self.num_heads, seqlen, q_w, k_w, topk=topk, local_attn_mask=self.local_attn_mask)
 
         x = self.attn(reorder_q, reorder_k, reorder_v, attention_mask)
 
